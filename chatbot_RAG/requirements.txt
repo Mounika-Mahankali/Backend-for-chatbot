@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+langchain
+streamlit
+rank-bm25
+python-pptx
+pillow
