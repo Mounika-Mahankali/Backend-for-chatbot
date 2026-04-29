@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from pydantic import BaseModel, field_validator
 import hashlib, shutil, os, traceback, uuid, re
+import json
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from jose import jwt, JWTError
@@ -8,7 +9,12 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
 
-from rag import load_rag, save_pdfs_to_db, generate_image_response
+from rag import (
+    load_rag,
+    save_pdfs_to_db,
+    save_image_description_to_db,
+    vectorless_docs
+)
 from multimodal import get_response
 from db import SessionLocal, User, Chat, ChatSession
 
@@ -26,7 +32,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:4200"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -57,6 +63,37 @@ class ChatRequest(BaseModel):
 
 class RenameRequest(BaseModel):
     title: str
+
+
+def get_session_file_paths(session: ChatSession):
+    if not session.pdf_path:
+        return []
+
+    try:
+        data = json.loads(session.pdf_path)
+        if isinstance(data, list):
+            return [path for path in data if isinstance(path, str)]
+    except json.JSONDecodeError:
+        pass
+
+    return [session.pdf_path]
+
+
+def set_session_file_paths(session: ChatSession, file_paths):
+    session.pdf_path = json.dumps(file_paths)
+
+
+def ensure_session_documents_loaded(session: ChatSession):
+    if session.id in vectorless_docs:
+        return
+
+    stored_paths = [
+        path for path in get_session_file_paths(session)
+        if os.path.exists(path)
+    ]
+
+    if stored_paths:
+        save_pdfs_to_db(stored_paths, chat_session_id=session.id)
 
 # AUTH 
 def create_access_token(data: dict):
@@ -187,6 +224,8 @@ def chat(request: ChatRequest, background_tasks: BackgroundTasks, current_user: 
         if not session:
             raise HTTPException(403, "Unauthorized session")
 
+        ensure_session_documents_loaded(session)
+
         # SUMMARY COMMAND
         if "summar" in request.message.lower():
             msgs = db.query(Chat).filter_by(session_id=request.session_id).all()
@@ -238,8 +277,14 @@ async def upload_docs(session_id: int, file: UploadFile = File(...), current_use
         if not session:
             raise HTTPException(403, "Unauthorized")
 
-        if not file.filename.endswith((".pdf", ".txt", ".docx")):
-            raise HTTPException(400, "Invalid file")
+        if not file.filename:
+            raise HTTPException(400, "Missing file name")
+
+        allowed_extensions = (".pdf", ".txt", ".docx", ".csv", ".pptx")
+        file_extension = os.path.splitext(file.filename.lower())[1]
+
+        if file_extension not in allowed_extensions:
+            raise HTTPException(400, f"Invalid file type. Allowed: {', '.join(allowed_extensions)}")
 
         path = f"uploads/{uuid.uuid4()}_{file.filename}"
         os.makedirs("uploads", exist_ok=True)
@@ -248,8 +293,23 @@ async def upload_docs(session_id: int, file: UploadFile = File(...), current_use
             shutil.copyfileobj(file.file, f)
 
         save_pdfs_to_db([path], chat_session_id=session_id)
+        existing_paths = get_session_file_paths(session)
+        existing_paths.append(path)
+        set_session_file_paths(session, existing_paths)
+        session.has_embeddings = 1
+        session.embeddings_updated_at = datetime.utcnow()
+        db.commit()
 
-        return {"status": "success", "message": "Uploaded"}
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "session_id": session_id
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Document upload failed: {str(e)}")
 
     finally:
         db.close()
@@ -264,12 +324,21 @@ async def upload_image(session_id: int, file: UploadFile = File(...), current_us
             raise HTTPException(403, "Unauthorized")
 
         img = await file.read()
-        response = generate_image_response("Describe image", img)
+        response = save_image_description_to_db(
+            image_bytes=img,
+            filename=file.filename or "uploaded_image",
+            chat_session_id=session_id
+        )
 
         db.add(Chat(session_id=session_id, message="Image uploaded", response=response))
         db.commit()
 
         return {"status": "success", "response": response}
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Image upload failed: {str(e)}")
 
     finally:
         db.close()
