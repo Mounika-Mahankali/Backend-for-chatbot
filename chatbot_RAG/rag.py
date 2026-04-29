@@ -20,8 +20,7 @@ from langchain_community.document_loaders import (
     PyPDFLoader,
     Docx2txtLoader,
     TextLoader,
-    CSVLoader,
-    UnstructuredPowerPointLoader
+    CSVLoader
 )
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -31,8 +30,6 @@ from pathlib import Path
 from rank_bm25 import BM25Okapi
 
 from pptx import Presentation
-from PIL import Image
-import io
 from langchain_core.documents import Document
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
@@ -122,47 +119,135 @@ def post_process_response(response):
 
 
 # Load documents
+def load_pptx_documents(file_path):
+
+    presentation = Presentation(str(file_path))
+    documents = []
+
+    for slide_number, slide in enumerate(presentation.slides, start=1):
+        slide_parts = []
+
+        for shape in slide.shapes:
+            if hasattr(shape, "text") and shape.text and shape.text.strip():
+                slide_parts.append(shape.text.strip())
+
+        slide_text = "\n".join(slide_parts).strip()
+
+        if slide_text:
+            documents.append(
+                Document(
+                    page_content=f"Slide {slide_number}\n{slide_text}",
+                    metadata={
+                        "slide_number": slide_number,
+                        "content_type": "slide_text"
+                    }
+                )
+            )
+
+    return documents
+
+
 def load_documents(file_path):
 
-    file_path = str(file_path).lower()
+    file_path = Path(file_path)
+    file_suffix = file_path.suffix.lower()
+    file_str = str(file_path)
 
-    if file_path.endswith(".pdf"):
-        loader = PyPDFLoader(file_path)
+    if file_suffix == ".pdf":
+        loader = PyPDFLoader(file_str)
+        return loader.load()
 
-    elif file_path.endswith(".docx"):
-        loader = Docx2txtLoader(file_path)
+    if file_suffix == ".docx":
+        loader = Docx2txtLoader(file_str)
+        return loader.load()
 
-    elif file_path.endswith(".txt"):
-        loader = TextLoader(file_path)
+    if file_suffix == ".txt":
+        loader = TextLoader(file_str)
+        return loader.load()
 
-    elif file_path.endswith(".csv"):
-        loader = CSVLoader(file_path)
+    if file_suffix == ".csv":
+        loader = CSVLoader(file_str)
+        return loader.load()
 
-    elif file_path.endswith(".pptx"):
-        loader = UnstructuredPowerPointLoader(file_path)
+    if file_suffix == ".pptx":
+        return load_pptx_documents(file_path)
 
-    else:
-        raise ValueError(f"Unsupported file format: {file_path}")
-
-    return loader.load()
+    raise ValueError(f"Unsupported file format: {file_path}")
 
 
 def extract_images_from_ppt(ppt_path):
 
     images = []
 
-    prs = Presentation(ppt_path)
+    prs = Presentation(str(ppt_path))
 
-    for slide in prs.slides:
+    for slide_number, slide in enumerate(prs.slides, start=1):
+        image_index = 0
         for shape in slide.shapes:
             if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                image_index += 1
 
                 image = shape.image
                 image_bytes = image.blob
 
-                images.append(image_bytes)
+                images.append(
+                    {
+                        "bytes": image_bytes,
+                        "slide_number": slide_number,
+                        "image_index": image_index
+                    }
+                )
 
     return images
+
+
+def persist_vectorless_store():
+
+    with open(CHUNKS_FILE, "wb") as f:
+        pickle.dump(
+            {
+                "docs": vectorless_docs,
+                "bm25_models": bm25_models
+            },
+            f
+        )
+
+
+def rebuild_bm25_for_session(chat_session_id):
+
+    docs = vectorless_docs.get(chat_session_id, [])
+
+    if not docs:
+        bm25_models.pop(chat_session_id, None)
+        persist_vectorless_store()
+        return
+
+    tokenized_docs = [
+        doc.page_content.lower().split()
+        for doc in docs
+    ]
+
+    bm25_models[chat_session_id] = BM25Okapi(tokenized_docs)
+    persist_vectorless_store()
+
+
+def store_documents_in_session(documents, chat_session_id):
+
+    if not documents:
+        return
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100
+    )
+
+    new_docs = text_splitter.split_documents(documents)
+
+    if chat_session_id not in vectorless_docs:
+        vectorless_docs[chat_session_id] = []
+
+    vectorless_docs[chat_session_id].extend(new_docs)
+    rebuild_bm25_for_session(chat_session_id)
 
 # Load vectorless docs
 def load_vectorless_docs(pdf_paths, chat_session_id):
@@ -180,7 +265,10 @@ def load_vectorless_docs(pdf_paths, chat_session_id):
 
         if documents:
             for doc in documents:
-                doc.metadata = {"source": file_path.name}
+                doc.metadata = {
+                    **doc.metadata,
+                    "source": file_path.name
+                }
                 all_documents.append(doc)
 
         # Extract images from PPT
@@ -195,13 +283,18 @@ def load_vectorless_docs(pdf_paths, chat_session_id):
                     try:
                         caption = get_response(
                             "Describe this image in detail",
-                            img
+                            img["bytes"]
                         )
 
                         all_documents.append(
                             Document(
                                 page_content=caption,
-                                metadata={"source": file_path.name}
+                                metadata={
+                                    "source": file_path.name,
+                                    "slide_number": img["slide_number"],
+                                    "image_index": img["image_index"],
+                                    "content_type": "slide_image_caption"
+                                }
                             )
                         )
 
@@ -210,34 +303,26 @@ def load_vectorless_docs(pdf_paths, chat_session_id):
                     except Exception as e:
                         print(f"Image extraction error: {e}")
 
-    # Split documents
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100
-    )
-
-    new_docs = text_splitter.split_documents(all_documents)
-
-    if chat_session_id not in vectorless_docs:
-        vectorless_docs[chat_session_id] = []
-
-    vectorless_docs[chat_session_id].extend(new_docs)
-
-    # rebuild bm25
-    tokenized_docs = [
-    doc.page_content.lower().split()
-    for doc in vectorless_docs[chat_session_id]
-]
-
-    bm25_models[chat_session_id] = BM25Okapi(tokenized_docs)
-
-    with open(CHUNKS_FILE, "wb") as f:
-        pickle.dump({
-    "docs": vectorless_docs,
-    "bm25_models": bm25_models
-}, f)
+    store_documents_in_session(all_documents, chat_session_id)
 
     print("Chunks stored:", len(vectorless_docs))
+
+
+def save_image_description_to_db(image_bytes, filename, chat_session_id):
+
+    caption = generate_image_response("Describe this image in detail", image_bytes)
+
+    document = Document(
+        page_content=caption,
+        metadata={
+            "source": filename,
+            "content_type": "uploaded_image_caption"
+        }
+    )
+
+    store_documents_in_session([document], chat_session_id)
+
+    return caption
 
 
 def filter_best_document(docs):
@@ -355,6 +440,9 @@ def bm25_retrieval(query, chat_session_id):
     scores = list(scores)
 
     scored_docs = list(zip(scores, vectorless_docs[chat_session_id]))
+
+    if not scored_docs:
+        return []
 
     scored_docs = sorted(
         scored_docs,
