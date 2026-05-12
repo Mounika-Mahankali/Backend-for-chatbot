@@ -3,15 +3,11 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.language_models import LLM
 from typing import Optional, List
-
-
+from pptx import Presentation
+from langchain_core.documents import Document
 from multimodal import get_response
-
-
 import pickle
 import os
-
-
 import re
 from logger import log_execution
 
@@ -24,32 +20,25 @@ from langchain_community.document_loaders import (
 )
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
 from pathlib import Path
-
 from rank_bm25 import BM25Okapi
-
 from pptx import Presentation
-from langchain_core.documents import Document
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
-
-vectorless_docs = {}   # session_id → docs
-bm25_models = {}       # session_id → bm25 model
+vectorless_docs = {}   # session_id to docs
+bm25_models = {}       # session_id to  bm25 model
 CHUNKS_FILE = "vectorless_chunks.pkl"
 # Load chunks if file exists or Load saved chunks
 if os.path.exists(CHUNKS_FILE):
-
     with open(CHUNKS_FILE, "rb") as f:
-
         data = pickle.load(f)
 
-        # Ensure correct structure (dictionary)
+        # correct structure (dictionary)
         if isinstance(data, dict):
             vectorless_docs = data.get("docs", {})
             bm25_models = data.get("bm25_models", {})
         else:
-            # OLD format → reset
+            
             print("Old chunk format detected. Resetting...")
             vectorless_docs = {}
             bm25_models = {}
@@ -78,12 +67,26 @@ def generate_response(llm, prompt):
 
 
 @log_execution("reranking")
-def rerank_documents(query, docs, top_k=5):
+def rerank_documents(query, docs, top_k=15):
 
     if not docs:
         return docs
 
+    # query_tokens = re.findall(r"\w+", query.lower())
     query_tokens = re.findall(r"\w+", query.lower())
+
+    # add simple normalization
+    expanded_tokens = set(query_tokens)
+
+    # basic normalization (generic)
+    for token in query_tokens:
+        if token.endswith("s"):
+            expanded_tokens.add(token[:-1])
+        if token.endswith("ing"):
+            expanded_tokens.add(token[:-3])
+
+    query_tokens = list(expanded_tokens)
+        
 
     scored_docs = []
 
@@ -91,13 +94,17 @@ def rerank_documents(query, docs, top_k=5):
 
         text = doc.page_content.lower()
 
-        score = sum(
-            1 for token in query_tokens 
-            if token in text
-        )
+        score = sum(1 for token in query_tokens if token in text)
 
-        if score >= 3:   
-            scored_docs.append((score, doc))
+        if "\n" in doc.page_content:
+            score += 2
+
+       
+        if any(char.isdigit() for char in doc.page_content):
+            score += 2
+
+          
+        scored_docs.append((score, doc))
 
     ranked_docs = sorted(
         scored_docs,
@@ -170,7 +177,7 @@ def load_documents(file_path):
         return loader.load()
 
     if file_suffix == ".pptx":
-        return load_pptx_documents(file_path)
+        return load_pptx(file_path)
 
     raise ValueError(f"Unsupported file format: {file_path}")
 
@@ -230,15 +237,15 @@ def rebuild_bm25_for_session(chat_session_id):
     bm25_models[chat_session_id] = BM25Okapi(tokenized_docs)
     persist_vectorless_store()
 
-
+#chunking 
 def store_documents_in_session(documents, chat_session_id):
 
     if not documents:
         return
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100
+        chunk_size=1500,
+    chunk_overlap=200
     )
 
     new_docs = text_splitter.split_documents(documents)
@@ -367,15 +374,36 @@ def load_rag(chat_session_id=None):
 
         docs = hybrid_retrieval(query, chat_session_id)
 
+        query_words = set(query.lower().split())
+
+        filtered_docs = []
+        for doc in docs:
+            text = doc.page_content.lower()
+            
+            match_count = sum(1 for word in query_words if word in text)
+            
+            if match_count >= 1:
+                filtered_docs.append(doc)
+
+        # fallback if nothing found
+        if filtered_docs:
+            docs = filtered_docs
+
+        
+        if len(query.split()) <= 4:
+            docs = docs[:20]   
+
         docs = rerank_documents(query, docs)
 
-        docs = filter_best_document(docs)
+
+        #docs = filter_best_document(docs)
 
         if not docs:
             response = generate_response(llm, query)
             return post_process_response(response)
-
-        context = format_docs(docs)
+        
+        docs = docs[:12]
+        context = "\n\n".join(doc.page_content for doc in docs[:8])
 
         
         prompt = create_rag_prompt(context, query)
@@ -453,12 +481,13 @@ def bm25_retrieval(query, chat_session_id):
     
     top_score = scored_docs[0][0] if scored_docs else 0
 
-    filtered_docs = [
-        doc for score, doc in scored_docs
-        if score >= top_score * 0.6   
-    ]
+    # filtered_docs = [
+    #     doc for score, doc in scored_docs
+    #     if score >= top_score * 0.6   
+    # ]
+    filtered_docs = [doc for score, doc in scored_docs]
 
-    return filtered_docs[:5]
+    return filtered_docs[:15]
 
 
 def preprocess_query(query):
@@ -484,7 +513,7 @@ def keyword_retrieval(query, chat_session_id):
 
     global vectorless_docs
 
-    query_tokens = query.lower().split()
+    query_tokens = re.findall(r"\w+", query.lower())
 
     matched_docs = []
 
@@ -496,7 +525,7 @@ def keyword_retrieval(query, chat_session_id):
         if any(token in text for token in query_tokens):
             matched_docs.append(doc)
 
-    return matched_docs[:5]
+    return matched_docs[:15]
 
 
 def hybrid_retrieval(query, chat_session_id):
@@ -519,32 +548,39 @@ def hybrid_retrieval(query, chat_session_id):
             unique_docs.append(doc)
             seen.add(content)
 
-    return unique_docs[:top_k]
+    return unique_docs[:15]
 
 
 #diff queries need different retrieval sizes 
+# def dynamic_top_k(query):
+
+#     query = query.lower()
+
+#     if any(word in query for word in ["list", "keywords", "types", "advantages"]):
+#         return 6
+
+#     if any(word in query for word in ["what is", "define", "meaning"]):
+#         return 2
+
+#     if any(word in query for word in ["difference", "compare"]):
+#         return 4
+
+#     return 5
+
 def dynamic_top_k(query):
-
-    query = query.lower()
-
-    if any(word in query for word in ["list", "keywords", "types", "advantages"]):
-        return 6
-
-    if any(word in query for word in ["what is", "define", "meaning"]):
-        return 2
-
-    if any(word in query for word in ["difference", "compare"]):
-        return 4
-
-    return 5
-
-
+    return 12
 def create_rag_prompt(context, query):
     return f"""
-You are a helpful AI assistant.
+You are an AI assistant.
 
-Answer ONLY from the provided context.
-Do NOT add extra information.
+Extract the exact information from the context.
+
+If the answer is present as a table or structured format:
+- return it clearly
+- do NOT summarize
+- do NOT say "not available" if present
+
+If multiple rows exist, include all rows.
 
 Context:
 {context}
@@ -554,3 +590,32 @@ Question:
 
 Answer:
 """
+
+
+def load_pptx(file_path):
+    docs = []
+
+    prs = Presentation(file_path)
+
+    for slide in prs.slides:
+        slide_text = []
+
+        for shape in slide.shapes:
+
+            # Normal text
+            if hasattr(shape, "text"):
+                slide_text.append(shape.text)
+
+            # Table extraction (VERY IMPORTANT)
+            if shape.has_table:
+                table = shape.table
+                for row in table.rows:
+                    row_data = " | ".join(cell.text.strip() for cell in row.cells)
+                    slide_text.append(row_data)
+
+        full_text = "\n".join(slide_text)
+
+        docs.append(Document(page_content=full_text))
+
+    return docs
+

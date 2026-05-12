@@ -3,6 +3,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
+import pytz
 
 engine = create_engine("sqlite:///chatbot.db") #connect db 
 Base = declarative_base() #creates tables using classes
@@ -26,6 +27,9 @@ with engine.connect() as conn:
     except OperationalError:
         pass
 
+def get_ist_time():
+    return datetime.now(pytz.timezone("Asia/Kolkata"))
+
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -44,11 +48,13 @@ class ChatSession(Base):
 
 class Chat(Base):
     __tablename__ = "chats"
+
     id = Column(Integer, primary_key=True)
     session_id = Column(Integer)
     message = Column(Text)
     response = Column(Text)
-    image = Column(Text)   # (base64 image)
+    image = Column(Text)
     logs = Column(Text)
+    created_at = Column(DateTime, default=get_ist_time) 
 
 Base.metadata.create_all(engine)

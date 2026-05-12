@@ -2,6 +2,8 @@ from groq import Groq
 import base64
 import os
 from dotenv import load_dotenv
+import pyttsx3
+import uuid
 
 load_dotenv()
 
@@ -54,4 +56,32 @@ def get_response(text=None, image=None):
         return response.choices[0].message.content
 
     except Exception as e:
-        return f"⚠️ Error: {str(e)}"
+        return f" Error: {str(e)}"
+    
+def speech_to_text(audio_file_path):
+
+    with open(audio_file_path, "rb") as file:
+
+        transcription = client.audio.transcriptions.create(
+            file=file,
+            model="whisper-large-v3",
+            response_format="json"
+        )
+
+    return transcription.text
+
+
+def text_to_speech(text):
+
+    engine = pyttsx3.init()
+
+    os.makedirs("audio_responses", exist_ok=True)
+
+    filename = f"audio_responses/{uuid.uuid4()}.mp3"
+
+    engine.save_to_file(text, filename)
+
+    engine.runAndWait()
+
+    return filename
+    

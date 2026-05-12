@@ -9,6 +9,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import BackgroundTasks
 
+
 from rag import (
     load_rag,
     save_pdfs_to_db,
@@ -17,6 +18,12 @@ from rag import (
 )
 from multimodal import get_response
 from db import SessionLocal, User, Chat, ChatSession
+
+from multimodal import speech_to_text
+from multimodal import text_to_speech
+
+from reportlab.pdfgen import canvas
+from fastapi.responses import FileResponse
 
 #  ENV 
 load_dotenv()
@@ -215,12 +222,22 @@ def rename_chat(chat_id: int, request: RenameRequest, current_user: dict = Depen
     finally:
         db.close()
 
-#  CHAT 
+
+# CHAT
 @app.post("/chat")
-def chat(request: ChatRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+def chat(
+    request: ChatRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user)
+):
     db = SessionLocal()
+
     try:
-        session = db.query(ChatSession).filter_by(id=request.session_id, user_id=current_user["user_id"]).first()
+        session = db.query(ChatSession).filter_by(
+            id=request.session_id,
+            user_id=current_user["user_id"]
+        ).first()
+
         if not session:
             raise HTTPException(403, "Unauthorized session")
 
@@ -228,29 +245,92 @@ def chat(request: ChatRequest, background_tasks: BackgroundTasks, current_user: 
 
         # SUMMARY COMMAND
         if "summar" in request.message.lower():
-            msgs = db.query(Chat).filter_by(session_id=request.session_id).all()
-            text = "".join([f"User:{m.message}\nBot:{m.response}\n" for m in msgs])
+
+            msgs = db.query(Chat).filter_by(
+                session_id=request.session_id
+            ).all()
+
+            text = "".join(
+                [f"User:{m.message}\nBot:{m.response}\n" for m in msgs]
+            )
 
             summary = get_response(f"Summarize:\n{text}")
 
-            db.add(Chat(session_id=request.session_id, message=request.message, response=summary))
+            db.add(
+                Chat(
+                    session_id=request.session_id,
+                    message=request.message,
+                    response=summary
+                )
+            )
+
             session.summary = summary
+
             db.commit()
 
-            return {"status": "success", "response": summary}
+            return {
+                "status": "success",
+                "response": summary
+            }
+
+        # FETCH PREVIOUS CONVERSATIONS
+        previous_chats = (
+            db.query(Chat)
+            .filter_by(session_id=request.session_id)
+            .order_by(Chat.id.desc())
+            .limit(3)
+            .all()
+        )
+
+        # BUILD CONVERSATION CONTEXT
+        conversation_context = ""
+
+        for chat_item in reversed(previous_chats):
+
+            conversation_context += f"""
+User: {chat_item.message}
+Assistant: {chat_item.response}
+"""
+
+        # ENHANCED QUERY WITH CONTEXT
+        enhanced_query = f"""
+Previous Conversation:
+{conversation_context}
+
+Current Question:
+{request.message}
+"""
 
         # RAG
         qa = load_rag(chat_session_id=request.session_id)
-        response = qa(request.message)
 
-        db.add(Chat(session_id=request.session_id, message=request.message, response=response))
+        response = qa(enhanced_query)
+
+        # SAVE CHAT
+        db.add(
+            Chat(
+                session_id=request.session_id,
+                message=request.message,
+                response=response
+            )
+        )
+
         db.commit()
 
-        return {"status": "success", "response": response}
+        return {
+            "status": "success",
+            "response": response
+        }
 
     except Exception as e:
+
         db.rollback()
-        return {"status": "error", "details": str(e)}
+
+        return {
+            "status": "error",
+            "details": str(e)
+        }
+
     finally:
         db.close()
 
@@ -339,6 +419,160 @@ async def upload_image(session_id: int, file: UploadFile = File(...), current_us
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Image upload failed: {str(e)}")
+
+    finally:
+        db.close()
+
+
+
+# VOICE CHAT
+@app.post("/voice-chat")
+async def voice_chat(
+    session_id: int,
+    audio: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user)
+):
+
+    db = SessionLocal()
+
+    try:
+
+        session = db.query(ChatSession).filter_by(
+            id=session_id,
+            user_id=current_user["user_id"]
+        ).first()
+
+        if not session:
+            raise HTTPException(403, "Unauthorized session")
+
+        ensure_session_documents_loaded(session)
+
+        os.makedirs("temp_audio", exist_ok=True)
+
+        audio_path = f"temp_audio/{audio.filename}"
+
+        
+        with open(audio_path, "wb") as buffer:
+            buffer.write(await audio.read())   #await reads uploaded audio bytes
+        transcribed_text = speech_to_text(audio_path)
+
+        qa = load_rag(chat_session_id=session_id)
+        response = qa(transcribed_text)
+        audio_response_path = text_to_speech(response)
+        db.add(
+            Chat(
+                session_id=session_id,
+                message=transcribed_text,
+                response=response
+            )
+        )
+
+        db.commit()
+
+        return {
+            "status": "success",
+            "transcribed_text": transcribed_text,
+            "response": response
+        }
+
+    except Exception as e:
+
+        db.rollback()
+
+        return {
+            "status": "error",
+            "details": str(e)
+        }
+
+    finally:
+        db.close()
+
+def generate_chat_pdf(chats):
+
+    os.makedirs("chat_exports", exist_ok=True)
+
+    filename = f"chat_exports/{uuid.uuid4()}.pdf"
+
+    c = canvas.Canvas(filename) #Canvas is new pdf file instance 
+
+    y = 800
+
+    c.setFont("Helvetica", 12)
+
+    c.drawString(200, y, "Chat Export")
+
+    y -= 40
+
+    text_object = c.beginText(40, 800)
+
+    text_object.setFont("Helvetica", 12)
+
+    for chat in chats:
+
+        text_object.textLine(f"User: {chat.message}")
+        text_object.textLine("")
+
+        
+        response_lines = chat.response.split("\n")
+
+        for line in response_lines:
+
+            
+            while len(line) > 100:
+
+                text_object.textLine(line[:100])
+                line = line[100:]
+
+            text_object.textLine(line)
+
+        text_object.textLine("")
+        text_object.textLine("-" * 80)
+        text_object.textLine("")
+
+    c.drawText(text_object)
+
+        # new page
+    if y < 100:
+        c.showPage()
+        y = 800
+        c.setFont("Helvetica", 12)
+
+    c.save()
+
+    return filename
+
+
+
+@app.get("/export-chat/{session_id}")
+def export_chat(
+    session_id: int,
+    current_user: dict = Depends(get_current_user)
+):
+    db = SessionLocal()
+
+    try:
+        session = db.query(ChatSession).filter_by(
+            id=session_id,
+            user_id=current_user["user_id"]
+        ).first()
+
+        if not session:
+            raise HTTPException(403, "Unauthorized session")
+        
+        chats = db.query(Chat).filter_by(
+            session_id=session_id
+        ).all()
+
+        if not chats:
+            raise HTTPException(404, "No chats found")
+
+        
+        pdf_path = generate_chat_pdf(chats)
+        return FileResponse(
+            path=pdf_path,
+            filename="chat_export.pdf",
+            media_type="application/pdf"
+        )
 
     finally:
         db.close()
